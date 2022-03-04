@@ -1,0 +1,381 @@
+---
+title: "HarvardX PH125.9 Independent Capstone Project: Can We Predict Happiness?"
+author: "Oscar Mak"
+date: "March 2022"
+output: pdf_document
+urlcolor: blue
+---
+
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(pdftools)) install.packages("pdftools", repos = "http://cran.us.r-project.org")
+if(!require(haven)) install.packages("haven", repos = "http://cran.us.r-project.org")
+if(!require(xgboost)) install.packages("xgboost", repos = "http://cran.us.r-project.org")
+if(!require(scales)) install.packages("scales", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(pdftools)
+library(haven)
+library(xgboost)
+library(scales)
+```
+
+## 1. Introduction
+The study of happiness has been in the popular zeitgeist recently. On Jan 23, 2022 CNN published an article with the headline “[Two years into the pandemic, Yale's 'happiness' course is more popular than ever](https://edition.cnn.com/2022/01/23/us/yale-happiness-course-pandemic-wellness/index.html)”. More than 3.7 million people have enrolled in the free online course referenced by CNN in this article. The course appears to be well-liked, earning a rating of 4.9 stars (out of 5) from 31,743 ratings as of March 3, 2022.
+
+More recently, the Wall Street Journal published “[Harvard Wants M.B.A.s to Learn How to Be Happy at Work](https://www.wsj.com/articles/harvard-wants-m-b-a-s-to-learn-how-to-be-happy-at-work-11644836400)” on Feb 14, 2022. The article describes an oversubscribed course in the Harvard MBA program called “Leadership and Happiness” taught by Arthur Brooks. Professor Brooks also writes a popular series of articles in The Atlantic titled “How to Build a Life”.
+
+Motivated by my experience taking the course mentioned by CNN and by reading some of Professor Brooks’s writing, I performed an analysis of General Social Survey (GSS) data to see if self-rating of happiness can be predicted using other responses to the survey.
+
+Survey respondents rated themselves as either very happy, pretty happy, or not too happy. A naïve model predicting the modal (most frequent) response correctly predicted the correct outcome with 56.0% accuracy. A classification model using the XGBoost package improved the accuracy only slightly to 63.0%. Satisfaction with present financial situation, whether someone found life exciting, routine, or dull, and marital status were the three most important features in predicting the happiness outcome. 
+
+## 2. Methods and analysis
+### 2.1. About the data
+The GSS is a survey of Americans’ well-being and attitudes conducted annually by the National Opinion Research Center (NORC) at the University of Chicago since 1972.
+
+The GSS includes a set of core demographic, behavioral, and attitudinal questions that are asked every year (the replicating core). In addition, topics of special interest are added from time to time. Past examples of such special interest topics include national spending priorities, intergroup tolerance, and attitudes toward morality.
+
+#### 2.1.1. Loading the data
+The complete GSS dataset is available to the public in STATA format as a Zip file. The following code downloads the data, unzips it, and loads it into an R dataframe.
+```{r Loading the data}
+# Download and unzip General Social Survery (GSS) data file
+dl <- tempfile()
+download.file("https://gss.norc.org/documents/stata/GSS_stata.zip", dl)
+unzip(dl)
+gss_data <- read_dta("gss7221_r1b.dta")
+```
+
+#### 2.1.2. Exploring and cleaning the data
+A quick look at the data reveals that it is a pretty big dataset.
+```{r View data}
+str(gss_data, list.len = 3, width = 80, strict.width="cut")     
+```
+
+The dataset contains 68,846 observations of 6,309 variables. Each variable is additionally tagged with metadata. For example "wrkstat" is labeled as "labor force status" and a value of 1 here indicates that the respondent is working full time.
+
+##### 2.1.2.1. Filter for replicating core
+6,309 is a very large number of variables so we begin filtering out unhelpful variables. One such filter is to only include variables that correspond to the replicating core of questions that are asked every year. Variables not included in the replicating core are not asked every year and will therefore contain many NAs.
+
+To identify which variables are in the replicating core, we download a PDF titled “Repeated Items in the General Social Survey” and extract the PDF text using the following code.
+```{r Download rep core PDF and extract text}
+rep_core_pdf <- tempfile()
+download.file("https://gss.norc.org/Documents/other/Replicating%20Core.pdf",
+              rep_core_pdf)
+rep_core_text <- pdf_text(rep_core_pdf)     # Extract pdf text
+```
+
+Reading the PDF reveals that all replicating core variable names are included in pages 2-12 so we use the following code to remove the unnecessary pages.
+```{r Remove unnecessary pages}
+rep_core_text <- rep_core_text[2:12]
+```
+
+The variable names are three or more all caps text characters, followed by zero to three digits (for example, RACE and FAMILY16). We can therefore use regex to extract a list of variable names that we want and then keep only columns for those variables with this code.
+```{r Extract rep core variable names}
+# Extracts variables names for questions in replicating core into one long list
+pattern <- "[A-Z]{3,}[0-9]{0,3}"
+rep_core_codes <- str_extract_all(rep_core_text, pattern) %>%
+  unlist() %>%  
+  tolower()     # variables names are lowercase in gss_data
+rep_core_codes <- rep_core_codes[rep_core_codes != "gss"]  # GSS is survey name
+
+# Keep only columns in the replicating core
+gss_data <- gss_data[, colnames(gss_data) %in% rep_core_codes] 
+```
+
+After filtering for the replicating core we are left with `r length(gss_data)` variables.
+
+##### 2.1.2.2. Filter for near zero variance
+The following code removes variables with near zero variance. Removing such variables is desirable because they have little predictive power and can cause some models to become unstable or crash.
+```{r Remove near zero variance variables}
+nzv <- nearZeroVar(gss_data)
+gss_data <- gss_data[, -nzv]
+```
+
+`r length(gss_data)` variables remain after filtering for variables with near zero variance.
+
+##### 2.1.2.3. Filter for excess NAs
+We currently have a `r format(dim(gss_data)[1], big.mark=",", trim=TRUE)` by `r dim(gss_data)[2]` data frame. If every respondent answered every question then we would have a grid of `r format(dim(gss_data)[1]*dim(gss_data)[2], big.mark=",", trim=TRUE)` data points. We can use the is.na function to see that there are `r format(sum(is.na(gss_data)), big.mark=",", trim=TRUE)` NAs. A quick calculation finds that this is `r percent(sum(is.na(gss_data))/(dim(gss_data)[1] * dim(gss_data)[2]))` of the grid, so we have a lot of NAs. We can plot the number of variables by percentage of observations that are NA with the code below.
+
+```{r Histogram of variables by percent NA}
+colMeans(is.na(gss_data)) %>% 
+  hist(main = "Histogram of variables by % observations NA",
+       xlab = "% of variable observations is NA",
+       ylab = "Count of variables",
+       ylim = c(0, 100),
+       labels = TRUE)
+```
+
+The plot confirms that NAs are not evenly distributed. For example, 76 variables have observations that are 90-100% NAs (almost all NA) while 45 variables have 0-10% NAs. The following code filters out variables that are >40% NA.
+
+```{r Remove variables above 40% NA}
+low_NAs <- colMeans(is.na(gss_data)) <= 0.4
+gss_data <- gss_data[,low_NAs]
+```
+
+##### 2.1.2.4. Manual inspection of remaining variables
+We are left with `r length(gss_data)` variables after filtering for NAs. This is a manageable number to inspect manually for inclusion or exclusion. The following code creates a table of variables, the label assigned to each variable in the metadata, and the % NA for each variable. 
+```{r Table of remaining variables for manual inspection}
+n <- length(gss_data)
+data_labels <- vector(length = n)     # create an empty vector
+for(i in 1:n){
+  data_labels[i] <- attributes(gss_data[[i]])$label
+  } # fill vector with label metadata
+
+# Create table with data for each variable
+names_labels <- data.frame(
+  index = seq.int(length(data_labels)),
+  label = data_labels, 
+  pct_NA = percent(colMeans(is.na(gss_data)), accuracy = 0.1)
+  ) 
+names_labels     # Display table of variables with labels
+```
+
+We see that many of the variables can be removed for the following reasons:  
+1. _Redundant_ – occ10 (respondent’s occupation code) and indus10 (respondent’s industry code) are very similar. realinc (family income in constant $) and coninc (family income in constant dollars) are nearly identical. For each such pair of similar variables, only the one with lower % NA is kept.    
+2. _Interview logistics_ – variables regarding interview logistics such as region (geographic region of interview) and size (population of interview location in 1000s) were omitted. Where an interview took place should not have much bearing on a respondent’s happiness.  
+3. _Political and social beliefs_ – variables concerning specific political and social issues were omitted. Examples include natmass (does the country spend enough on mass transportation) and conlegis (degree of confidence in Congress).  
+4. _Parent info_ – variables concerning demographic information on the respondent’s parents were omitted. Examples include paind10 (father’s industry code) and madeg (mother’s highest degree).  
+
+The following code drops the unwanted variables.
+```{r Drop unwanted variables after manual inspection}
+# Create vector of column numbers for variables to keep
+keep_index <- c(1:4, 6, 7, 11:14, 17, 20:29, 37, 42, 43, 55:65, 79:83, 94:96, 
+                100, 107, 108, 111, 116, 117, 119:121, 123, 126) 
+gss_data <- gss_data[, keep_index]  # Drop unwanted variables
+```
+
+We are left with `r length(gss_data)` variables for our model as listed below.
+```{r List remaining variables}
+names_labels <- names_labels[keep_index,]     
+names_labels
+```
+
+##### 2.1.2.5. Explore years variable
+A quick look at the years variable shows that we have observations in most years from 1972 to 2021.
+```{r Look at years variable}
+unique(gss_data$year)
+```
+
+Since 2021 was an unusual year for happiness due to the COVID-19 pandemic, we remove observations from that year using the following code.
+```{r Drop 2021 observations}
+gss_data <- gss_data %>% filter(year != 2021)
+```
+
+##### 2.1.2.6. Explore happy variable
+Since the happy variable is the outcome that we want to predict, we ought to take a closer look at it. First, we use the is.na function to find that we have `r format(sum(is.na(gss_data$happy)), big.mark=",", trim=TRUE)` NA observations in happy. The following code drops observations with NA in the happy variable.
+```{r Drop NAs}
+gss_data <- gss_data %>% drop_na(happy)
+```
+
+The following code provides additional information on the happy variable.
+```{r Look at happy variable}
+table(gss_data$happy)
+attributes(gss_data$happy)
+```
+
+We see that the values are categorical with 1 = very happy, 2 = pretty happy, and 3 = not too happy. We also see that 2 (pretty happy) is the most common response.
+
+### 2.2. Preparing data for XGBoost
+XGBoost requires the features for prediction to be formatted as a matrix. It also requires categorical outcome values to be formatted as integers starting from zero. The following code extracts the happy variable (our outcome) and adjusts the values such that 0 = very happy, 1 = pretty happy, and 2 = not too happy. It additionally puts the features in matrix format as required.
+```{r Prepare data for XGBoost}
+outcomes <- as.integer(gss_data$happy) - 1  # Extract happy, convert to integer from zero
+gss_data$happy <- NULL                      # Remove happy column from gss_data
+features <- as.matrix(gss_data)
+```
+
+### 2.3. Creating validation data set and splitting development data into train and test
+We carve out 10% of the data as a holdout validation data set that will be used to evaluate our final model. The remaining data will be used to develop and tune the model. This development data is further divided in a 90/10 split where 90% of the development data is used to train the model and 10% is used to test and tune the model. This partitioning of the data is accomplished with the following code. 
+```{r Split data, warning=FALSE}
+# Carve out 10 percent of data as validation set
+set.seed(1, sample.kind="Rounding") 
+test_index <- createDataPartition(y = outcomes, times = 1, p = 0.1, list = FALSE)
+dev_features <- features[-test_index,]
+dev_outcomes <- outcomes[-test_index]
+validation_features <- features[test_index,]
+validation_outcomes <- outcomes[test_index]
+
+# Split development data 90 pct into train_set and 10 pct into test_set
+set.seed(1, sample.kind="Rounding") 
+test_index <- createDataPartition(y = dev_outcomes, times = 1, p = 0.1, list = FALSE)
+train_features <- dev_features[-test_index,]
+train_outcomes <- dev_outcomes[-test_index]
+test_features <- dev_features[test_index,]
+test_outcomes <- dev_outcomes[test_index]
+```
+
+### 2.4. Model approach
+A naïve model predicting the most common happy response is used as a baseline. XGBoost is used to try to improve upon this  naive baseline. 
+
+#### 2.4.1. Naive prediction using mode
+The simplest model for our categorical happy outcome would be to predict the modal (most frequent) response in all cases. We saw in section 2.1.2.6 that "pretty happy" is the most frequest response. The following code predicts "pretty happy" in all cases yields an accuracy of 56.0% when applied to the test data set.
+```{r Naive prediction using mode}
+most_freq <- names(sort(-table(train_outcomes)))[1]
+most_freq
+mean(test_outcomes == most_freq)     
+```
+
+#### 2.4.2. XGBoost classification using trees
+Can XGBoost classification using trees beat the 56.0% accuracy achieved by naively predicting the mode? We convert our train and test data into XGBoost matrix objects and fit the XGBoost model using default values for tuning parameters eta, nrounds, and max.depth.
+```{r Run XGBoost using default parameters, warning=FALSE}
+# Convert train and test sets into XGBoost matrix objects
+xgboost_train <- xgb.DMatrix(data = train_features, label = train_outcomes)
+xgboost_test <- xgb.DMatrix(data = test_features, label = test_outcomes)
+
+# Train the model using defaults
+num_class <- length(levels(as.factor(train_outcomes)))
+fit <- xgb.train(data = xgboost_train,
+                 objective = "multi:softprob",   # output class probabilities
+                 booster = "gbtree",             # use tree for classification problems
+                 eval_metric = "mlogloss",
+                 watchlist = list(val_1 = xgboost_train),
+                 eta = 0.3,                      # tuning parameter default = 0.3
+                 nrounds = 100,                  # tuning parameter default = 100
+                 max.depth = 6,                  # tuning parameter default = 6
+                 num_class = num_class,
+                 early_stopping_rounds = 10,
+                 verbose = FALSE)                # turns off progress reports
+
+# Make predictions on test features. Output is probability by class
+pred <- as_tibble(predict(fit, test_features, reshape = TRUE))
+colnames(pred) <- levels(as.factor(train_outcomes)) 
+
+# Predict the class with the highest probability
+pred$prediction <- apply(pred, 1, function(x) colnames(pred)[which.max(x)])
+head(pred)   # Display first few rows
+
+# Calculate accuracy of predictions
+mean(pred$prediction == test_outcomes)  
+```
+When applied to our test data set, XGBoost (with default parameters) yields an accuracy of 61.7%, which is a modest improvement over the naïve model accuracy of 56.0%. Can we do better by tuning the XGBoost model?
+
+##### 2.4.2.1. Tuning eta in XGBoost
+We use the following code to tune the eta parameter in our XGBoost model. 
+```{r Tune eta, eval=FALSE}
+# This takes a while to run so turned off evaluation
+# Delete eval=FALSE to run, but be prepared to wait!
+etas <- seq(0, 1, 0.1)
+accuracies <- sapply(etas, function(n){
+  fit <- xgb.train(data = xgboost_train,
+                   objective = "multi:softmax",   # output class probabilities
+                   booster = "gbtree",            # use tree for classification problems
+                   eval_metric = "error",
+                   eta = n,                       # parameter being tuned
+                   nrounds = 100,                 # tuning parameter default = 100
+                   max.depth = 6,                 # tuning parameter default = 6
+                   num_class = num_class,
+                   verbose = FALSE)               # turns off progress reports
+  pred <- as_tibble(predict(fit, test_features, reshape = TRUE))
+  return(mean(pred == test_outcomes))  
+})
+best_eta <- etas[which.max(accuracies)]
+best_eta
+max(accuracies)
+```
+
+The best value for eta is found to be 0.1. This further improves our model accuracy from 61.7% (using default parameters) to 62.5% when applied to our test data set.
+
+##### 2.4.2.2. Tuning nrounds in XGBoost
+We use the tuned value of eta and the following code to tune the nrounds parameter in our XGBoost model. 
+```{r Tune nrounds, eval=FALSE}
+# This takes a while to run so turned off evaluation
+# Delete eval=FALSE to run, but be prepared to wait!
+nrounds <- seq(100, 200, 10)
+accuracies <- sapply(nrounds, function(n){
+  fit <- xgb.train(data = xgboost_train,
+                 objective = "multi:softmax",   # output class probabilities
+                 booster = "gbtree",            # use tree for classification problems
+                 eval_metric = "error",
+                 eta = best_eta,                # use prior tuning result
+                 nrounds = n,                   # parameter being tuned
+                 max.depth = 6,                 # tuning parameter default = 6
+                 num_class = num_class,
+                 verbose = FALSE)               # turns off progress reports
+  pred <- as_tibble(predict(fit, test_features, reshape = TRUE))
+  return(mean(pred == test_outcomes))  
+})
+best_nrounds <- nrounds[which.max(accuracies)]
+best_nrounds
+max(accuracies)
+```
+
+The best value for nrounds is found to be 150. This further improves our model accuracy from 62.5% with only eta tuned to 62.7% with both eta and nrounds tuned (when applied to our test data set).
+
+##### 2.4.2.3. Tuning max.depth in XGBoost
+We use the tuned values of eta and nrounds and the following code to tune the max.depth parameter in our XGBoost model. 
+```{r Tune max.depth, eval=FALSE}
+# This takes a while to run so turned off evaluation
+# Delete eval=FALSE to run, but be prepared to wait!
+depths <- seq(1, 10, 1)
+accuracies <- sapply(depths, function(n){
+  fit <- xgb.train(data = xgboost_train,
+                   objective = "multi:softmax",   # output class probabilities
+                   booster = "gbtree",            # use tree for classification problems
+                   eval_metric = "error",
+                   eta = best_eta,                # use prior tuning result
+                   nrounds = best_nrounds,        # use prior tuning result
+                   max.depth = n,                 # parameter being tuned
+                   num_class = num_class,
+                   verbose = FALSE)               # turns off progress reports
+  pred <- as_tibble(predict(fit, test_features, reshape = TRUE))
+  return(mean(pred == test_outcomes))  
+})
+best_depth <- depths[which.max(accuracies)]
+best_depth
+max(accuracies)
+```
+
+The best value for max.depth is found to be 6, which is the same as the default value. The accuracy of the model when applied to the test data set is unchanged at 62.7%.
+
+## 3. Results
+The tuned XGBoost model yields an accuracy of 62.7% when applied to the test data set, a modest improvement over the naïve model accuracy of 56.0%. We use the following code to apply the tuned model to the validation data set.
+```{r Apply tuned model to validation dataset, eval=FALSE}
+# Fit the model using tuned parameters
+# Turned off evaluation since prior tuning results are needed and those take
+# a very long time to run. Delete eval=FALSE here an in prior tuning to run.
+fit <- xgb.train(data = xgboost_train,
+                 objective = "multi:softmax",
+                 booster = "gbtree",         
+                 eval_metric = "error",
+                 max.depth = best_depth,    
+                 eta = best_eta,            
+                 nrounds = best_nrounds,    
+                 num_class = num_class,
+                 verbose = FALSE)
+
+# Apply to validation set
+pred <- as_tibble(predict(fit, validation_features, reshape = TRUE))
+final_accuracy <- mean(pred == validation_outcomes)
+final_accuracy   # 63.0% when applied to validation set
+```
+
+We achieve a final accuracy of 63.0%. Additionally, we can use the variable importance feature of XGBoost to see which features are the most important predictors of the happy outcome. 
+```{r See top 5 important features, eval=FALSE}
+# See note in prior code chunk about eval=FALSE
+importance <- xgb.importance(model = fit)
+head(importance, 5)
+```
+
+The five most important features for predicting the happy outcome are described as follows:  
+1. _satfin_ - satisfaction with present financial situation  
+2. _life_ - is life exciting, pretty routine, or dull  
+3. _marital_ - current marital status  
+4. _satjob_ - satisfaction with the work you do  
+5. _health_ - is own health excellent, good, fair, or poor
+
+## 4. Conclusion
+It turns out that happiness is difficult to predict! We did a lot of data cleaning to trim the GSS dataset from 6,309 variables to 54 variables. A naïve model that simply predicted the most frequent response in all cases resulted in 56.0% accuracy when applied to our test data set. A tuned XGBoost classification model improved that accuracy to 62.7% when applied to the test data set. This tuned model resulted in 63.0% accuracy when applied to the holdout validation data set. 
+
+The variable importance function of XGBoost revealed that the most important variables for predicting happiness were:  
+1. Satisfaction with present financial situation  
+2. Is life exciting, routine, or dull  
+3. Current marital status  
+4. Satisfaction with work  
+5. State of health  
+
+Another look at the topic of happiness is possible by examining other happiness survey data sets. In one [well-known example](https://www.pnas.org/doi/10.1073/pnas.1011492107), Princeton economists Angus Deaton and Daniel Kahnemann analyzed Gallup-Healthways (now Gallup-Sharecare) survey data. This data set included two distinct measures of happiness. The first was emotional well-being, or day-to-day joy, sadness, anger, etc. The second was life evaluation, which measures the respondent's overall satisfaction with their life on a continuous 0-10 scale. The more nuanced measures of happiness, plus the fact that life evaluation is a continuous variable rather than categorical, may allow different analyses to be conducted. For example, Deaton and Kahnemann famously concluded that additional income above $75,000/year increases the life evaluation measure of happiness but not the emotional well-being measure of happiness. This data set is only available to subscribers or full-time students on campus and therefore was not easily accessible for this analysis.       
+
+
